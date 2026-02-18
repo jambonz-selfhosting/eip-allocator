@@ -80,7 +80,7 @@ allocate_aws() {
 }
 
 #
-# Exoscale: uses metadata service + Exoscale API v2
+# Exoscale: uses metadata service + exo CLI
 #
 allocate_exoscale() {
   log "Cloud: Exoscale"
@@ -89,8 +89,6 @@ allocate_exoscale() {
   : "${EXOSCALE_API_SECRET:?EXOSCALE_API_SECRET env var is required for Exoscale}"
   : "${EXOSCALE_ZONE:?EXOSCALE_ZONE env var is required for Exoscale}"
 
-  local API_BASE="https://api-${EXOSCALE_ZONE}.exoscale.com/v2"
-
   # Get instance ID from metadata service
   INSTANCE_ID=$(curl -sf http://169.254.169.254/1.0/meta-data/instance-id)
   if [[ -z "$INSTANCE_ID" ]]; then
@@ -98,31 +96,20 @@ allocate_exoscale() {
   fi
   log "Instance ID: $INSTANCE_ID"
 
-  # Get instance details to check current EIPs
-  local instance_json
-  instance_json=$(curl -sf -H "Authorization: Bearer ${EXOSCALE_API_KEY}:${EXOSCALE_API_SECRET}" \
-    "${API_BASE}/instance/${INSTANCE_ID}" 2>/dev/null || echo "")
-
-  # If bearer auth doesn't work, try basic auth
-  if [[ -z "$instance_json" || "$instance_json" == *"error"* ]]; then
-    instance_json=$(curl -sf -u "${EXOSCALE_API_KEY}:${EXOSCALE_API_SECRET}" \
-      "${API_BASE}/instance/${INSTANCE_ID}")
-  fi
-
+  # Get current EIPs attached to this instance
   local current_eips
-  current_eips=$(echo "$instance_json" | jq -r '.["elastic-ips"][]?.id // empty' 2>/dev/null)
+  current_eips=$(exo compute instance show "$INSTANCE_ID" -z "$EXOSCALE_ZONE" -O json \
+    | jq -r '.elastic_ips[]?.id // empty' 2>/dev/null)
 
-  # List all EIPs and find ones matching our pool label
+  # List all EIPs and filter by pool label
   local all_eips_json
-  all_eips_json=$(curl -sf -u "${EXOSCALE_API_KEY}:${EXOSCALE_API_SECRET}" \
-    "${API_BASE}/elastic-ip")
+  all_eips_json=$(exo compute elastic-ip list -z "$EXOSCALE_ZONE" -O json)
 
-  # Filter EIPs by label
   local pool_eips
   pool_eips=$(echo "$all_eips_json" | jq -r \
     --arg key "$EIP_GROUP_ROLE_KEY" \
     --arg val "$EIP_GROUP_ROLE" \
-    '.["elastic-ips"][] | select(.labels[$key] == $val) | .id')
+    '.[] | select(.labels[$key] == $val) | .id')
 
   if [[ -z "$pool_eips" ]]; then
     die "No EIPs found with label ${EIP_GROUP_ROLE_KEY}=${EIP_GROUP_ROLE}"
@@ -138,21 +125,11 @@ allocate_exoscale() {
     done
   done
 
-  # Find an EIP that's not attached to any instance.
-  # We need to check each pool EIP against all instances.
-  # Simpler approach: try to attach each pool EIP; the API will fail if it's
-  # already attached (managed EIPs can attach to multiple, so we use description
-  # to track assignment).
-  #
-  # Better approach: list instances, collect all attached EIP IDs, find one from
+  # Find a free EIP: list all instances, collect attached EIP IDs, find one from
   # our pool that's not in that set.
-  local all_instances_json
-  all_instances_json=$(curl -sf -u "${EXOSCALE_API_KEY}:${EXOSCALE_API_SECRET}" \
-    "${API_BASE}/instance")
-
   local attached_eip_ids
-  attached_eip_ids=$(echo "$all_instances_json" | jq -r \
-    '.instances[]? | .["elastic-ips"][]?.id // empty' 2>/dev/null | sort -u)
+  attached_eip_ids=$(exo compute instance list -z "$EXOSCALE_ZONE" -O json \
+    | jq -r '.[]? | .elastic_ips[]?.id // empty' 2>/dev/null | sort -u)
 
   local free_eip=""
   for eip_id in $pool_eips; do
@@ -169,15 +146,11 @@ allocate_exoscale() {
   local eip_ip
   eip_ip=$(echo "$all_eips_json" | jq -r \
     --arg id "$free_eip" \
-    '.["elastic-ips"][] | select(.id == $id) | .ip')
+    '.[] | select(.id == $id) | .ip')
 
   log "Attaching EIP $free_eip ($eip_ip) to instance $INSTANCE_ID"
 
-  curl -sf -X PUT \
-    -u "${EXOSCALE_API_KEY}:${EXOSCALE_API_SECRET}" \
-    -H "Content-Type: application/json" \
-    -d "{\"instance\": {\"id\": \"${INSTANCE_ID}\"}}" \
-    "${API_BASE}/elastic-ip/${free_eip}:attach"
+  exo compute instance elastic-ip attach "$INSTANCE_ID" "$free_eip" -z "$EXOSCALE_ZONE"
 
   log "EIP attached successfully"
 }
