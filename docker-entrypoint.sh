@@ -84,6 +84,7 @@ allocate_aws() {
 #
 allocate_exoscale() {
   log "Cloud: Exoscale"
+  log "Zone: $EXOSCALE_ZONE, EIP pool: ${EIP_GROUP_ROLE_KEY}=${EIP_GROUP_ROLE}"
 
   : "${EXOSCALE_API_KEY:?EXOSCALE_API_KEY env var is required for Exoscale}"
   : "${EXOSCALE_API_SECRET:?EXOSCALE_API_SECRET env var is required for Exoscale}"
@@ -100,20 +101,38 @@ allocate_exoscale() {
   local current_eips
   current_eips=$(exo compute instance show "$INSTANCE_ID" -z "$EXOSCALE_ZONE" -O json \
     | jq -r '.elastic_ips[]?.id // empty' 2>/dev/null)
+  if [[ -n "$current_eips" ]]; then
+    log "Instance currently has EIPs: $current_eips"
+  else
+    log "Instance has no EIPs currently attached"
+  fi
 
-  # List all EIPs and filter by pool label
+  # List all EIPs and filter by description matching "key=value"
+  # (Exoscale EIPs don't support labels, so we encode the role in the description)
   local all_eips_json
   all_eips_json=$(exo compute elastic-ip list -z "$EXOSCALE_ZONE" -O json)
 
+  local total_eips
+  total_eips=$(echo "$all_eips_json" | jq 'length')
+  log "Found $total_eips total EIPs in zone $EXOSCALE_ZONE"
+
+  local match="${EIP_GROUP_ROLE_KEY}=${EIP_GROUP_ROLE}"
   local pool_eips
   pool_eips=$(echo "$all_eips_json" | jq -r \
-    --arg key "$EIP_GROUP_ROLE_KEY" \
-    --arg val "$EIP_GROUP_ROLE" \
-    '.[] | select(.labels[$key] == $val) | .id')
+    --arg match "$match" \
+    '.[] | select(.description == $match) | .id')
 
   if [[ -z "$pool_eips" ]]; then
-    die "No EIPs found with label ${EIP_GROUP_ROLE_KEY}=${EIP_GROUP_ROLE}"
+    # Log all EIP descriptions to help diagnose mismatches
+    log "Available EIP descriptions in zone:"
+    echo "$all_eips_json" | jq -r '.[] | "  \(.id) -> \(.description // "(none)")"' \
+      | while read -r line; do log "$line"; done
+    die "No EIPs found with description '${match}'"
   fi
+
+  local pool_count
+  pool_count=$(echo "$pool_eips" | wc -w | tr -d ' ')
+  log "Found $pool_count EIPs in pool (description='${match}')"
 
   # Check if this instance already has a pool EIP
   for eip_id in $pool_eips; do
@@ -125,34 +144,35 @@ allocate_exoscale() {
     done
   done
 
-  # Find a free EIP: list all instances, collect attached EIP IDs, find one from
-  # our pool that's not in that set.
-  local attached_eip_ids
-  attached_eip_ids=$(exo compute instance list -z "$EXOSCALE_ZONE" -O json \
-    | jq -r '.[]? | .elastic_ips[]?.id // empty' 2>/dev/null | sort -u)
-
-  local free_eip=""
+  # Find a free EIP by checking each pool EIP's instances field.
+  # (instance list doesn't include elastic_ips, so we query each EIP directly)
+  local free_eip="" eip_ip=""
   for eip_id in $pool_eips; do
-    if ! echo "$attached_eip_ids" | grep -q "^${eip_id}$"; then
+    local eip_json
+    eip_json=$(exo compute elastic-ip show "$eip_id" -z "$EXOSCALE_ZONE" -O json)
+    local attached
+    attached=$(echo "$eip_json" | jq -r '.instances // empty')
+    local this_ip
+    this_ip=$(echo "$eip_json" | jq -r '.ip_address')
+    if [[ -z "$attached" || "$attached" == "null" ]]; then
+      log "EIP $eip_id ($this_ip) is free"
       free_eip="$eip_id"
+      eip_ip="$this_ip"
       break
+    else
+      log "EIP $eip_id ($this_ip) is attached, skipping"
     fi
   done
 
   if [[ -z "$free_eip" ]]; then
-    die "No free EIPs available in pool ${EIP_GROUP_ROLE_KEY}=${EIP_GROUP_ROLE}"
+    die "No free EIPs available in pool (all $pool_count EIPs are attached)"
   fi
-
-  local eip_ip
-  eip_ip=$(echo "$all_eips_json" | jq -r \
-    --arg id "$free_eip" \
-    '.[] | select(.id == $id) | .ip')
 
   log "Attaching EIP $free_eip ($eip_ip) to instance $INSTANCE_ID"
 
   exo compute instance elastic-ip attach "$INSTANCE_ID" "$free_eip" -z "$EXOSCALE_ZONE"
 
-  log "EIP attached successfully"
+  log "EIP $eip_ip attached successfully to instance $INSTANCE_ID"
 }
 
 #
