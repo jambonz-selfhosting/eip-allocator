@@ -98,9 +98,13 @@ allocate_exoscale() {
   log "Instance ID: $INSTANCE_ID"
 
   # Get current EIPs attached to this instance
+  local instance_json
+  instance_json=$(exo compute instance show "$INSTANCE_ID" -z "$EXOSCALE_ZONE" -O json) \
+    || die "Failed to query instance $INSTANCE_ID"
+
+  # elastic_ips is an array of IP address strings (not objects)
   local current_eips
-  current_eips=$(exo compute instance show "$INSTANCE_ID" -z "$EXOSCALE_ZONE" -O json \
-    | jq -r '.elastic_ips[]?.id // empty' 2>/dev/null)
+  current_eips=$(echo "$instance_json" | jq -r '.elastic_ips[]? // empty' 2>/dev/null)
   if [[ -n "$current_eips" ]]; then
     log "Instance currently has EIPs: $current_eips"
   else
@@ -111,7 +115,8 @@ allocate_exoscale() {
   # (elastic-ip list only returns id/ip_address/zone; description and instances
   # are only available via elastic-ip show)
   local all_eips_json
-  all_eips_json=$(exo compute elastic-ip list -z "$EXOSCALE_ZONE" -O json)
+  all_eips_json=$(exo compute elastic-ip list -z "$EXOSCALE_ZONE" -O json) \
+    || die "Failed to list EIPs in zone $EXOSCALE_ZONE"
 
   local all_eip_ids
   all_eip_ids=$(echo "$all_eips_json" | jq -r '.[].id')
@@ -127,7 +132,8 @@ allocate_exoscale() {
   local free_eip="" eip_ip=""
   for eip_id in $all_eip_ids; do
     local eip_json
-    eip_json=$(exo compute elastic-ip show "$eip_id" -z "$EXOSCALE_ZONE" -O json)
+    eip_json=$(exo compute elastic-ip show "$eip_id" -z "$EXOSCALE_ZONE" -O json) \
+      || { log "Failed to query EIP $eip_id, skipping"; continue; }
     local desc
     desc=$(echo "$eip_json" | jq -r '.description // empty')
     local this_ip
@@ -142,17 +148,19 @@ allocate_exoscale() {
     pool_eips="$pool_eips $eip_id"
 
     # Check if this instance already has this pool EIP
-    for current_id in $current_eips; do
-      if [[ "$eip_id" == "$current_id" ]]; then
+    # (current_eips contains IP addresses, not IDs)
+    for current_ip in $current_eips; do
+      if [[ "$this_ip" == "$current_ip" ]]; then
         log "Already have pool EIP $eip_id ($this_ip) assigned, nothing to do"
         return 0
       fi
     done
 
     # Check if this EIP is free (not attached to any instance)
-    local attached
-    attached=$(echo "$eip_json" | jq -r '.instances // empty')
-    if [[ -z "$attached" || "$attached" == "null" ]]; then
+    # instances is null when unattached, or an array of instance names when attached
+    local attached_count
+    attached_count=$(echo "$eip_json" | jq '.instances | if . == null then 0 else length end')
+    if [[ "$attached_count" -eq 0 ]]; then
       if [[ -z "$free_eip" ]]; then
         log "EIP $eip_id ($this_ip) is free"
         free_eip="$eip_id"
