@@ -40,10 +40,24 @@ allocate_aws() {
 
   log "Instance: $INSTANCE_ID, Region: $REGION, Current public IP: $PUBLIC_IP"
 
+  # Must be the PRIMARY interface (device index 0). An EKS node runs the VPC CNI,
+  # which attaches additional ENIs (eth1, eth2, ...) for pod IPs, and
+  # describe-network-interfaces returns them in no particular order -- so
+  # NetworkInterfaces[0] is a coin flip. Associating the EIP with a secondary ENI
+  # "succeeds" and then does nothing useful: the node's public IP is on eth0, so
+  # the EIP never becomes the address the SBC advertises, while the EIP now looks
+  # in-use to the check below and every later restart dies with "No free EIPs".
+  # Seen on a live EKS cluster: the sip node's [0] happened to be eth0 and worked,
+  # the rtp node's [0] was eth1 and did not.
   NETWORK_INTERFACE_ID=$(aws ec2 describe-network-interfaces \
     --filters "Name=attachment.instance-id,Values=$INSTANCE_ID" \
+              "Name=attachment.device-index,Values=0" \
     --region "$REGION" \
     --query 'NetworkInterfaces[0].NetworkInterfaceId' --output text)
+
+  if [[ -z "$NETWORK_INTERFACE_ID" || "$NETWORK_INTERFACE_ID" == "None" ]]; then
+    die "No primary (device index 0) network interface found on $INSTANCE_ID"
+  fi
 
   # Get pool EIPs
   POOL_IPS=$(aws ec2 describe-addresses \
@@ -59,14 +73,43 @@ allocate_aws() {
     fi
   done
 
-  # Find first unassociated EIP in the pool
-  ALLOCATION_ID=$(aws ec2 describe-addresses \
+  # Also treat a pool EIP already associated with THIS instance as done, even if
+  # the metadata service does not report it as our public IP. Without this, a
+  # container restart on a node that already holds its EIP falls through to the
+  # "find an unassociated EIP" step, finds none, and dies -- so the pod can never
+  # start again. That is a permanent failure from a transient one.
+  read -r MINE_IP MINE_ENI MINE_ALLOC <<<"$(aws ec2 describe-addresses \
     --filters "Name=tag:${EIP_GROUP_ROLE_KEY},Values=${EIP_GROUP_ROLE}" \
+              "Name=instance-id,Values=$INSTANCE_ID" \
     --region "$REGION" \
-    --query 'Addresses[?AssociationId==null].AllocationId | [0]' --output text)
+    --query 'Addresses[0].[PublicIp,NetworkInterfaceId,AllocationId]' --output text)"
 
-  if [[ -z "$ALLOCATION_ID" || "$ALLOCATION_ID" == "None" ]]; then
-    die "No free EIPs available in pool ${EIP_GROUP_ROLE}"
+  if [[ -n "$MINE_IP" && "$MINE_IP" != "None" && "$MINE_ENI" == "$NETWORK_INTERFACE_ID" ]]; then
+    log "Pool EIP $MINE_IP already on our primary interface, nothing to do"
+    return 0
+  fi
+
+  if [[ -n "$MINE_IP" && "$MINE_IP" != "None" ]]; then
+    # Ours, but on the wrong interface -- the state an older version of this
+    # script could leave behind. Move it rather than dying: it is doing nothing
+    # where it is, and while it sits there no EIP in the pool looks free, so the
+    # search below would fail and the pod would never start again.
+    # --allow-reassociation moves it in one call, with no window in which the
+    # address is unassociated and another node could take it.
+    log "Pool EIP $MINE_IP is on $MINE_ENI, not our primary $NETWORK_INTERFACE_ID -- moving it"
+    ALLOCATION_ID="$MINE_ALLOC"
+    REASSOCIATE="--allow-reassociation"
+  else
+    # Find first unassociated EIP in the pool
+    ALLOCATION_ID=$(aws ec2 describe-addresses \
+      --filters "Name=tag:${EIP_GROUP_ROLE_KEY},Values=${EIP_GROUP_ROLE}" \
+      --region "$REGION" \
+      --query 'Addresses[?AssociationId==null].AllocationId | [0]' --output text)
+    REASSOCIATE="--no-allow-reassociation"
+
+    if [[ -z "$ALLOCATION_ID" || "$ALLOCATION_ID" == "None" ]]; then
+      die "No free EIPs available in pool ${EIP_GROUP_ROLE}"
+    fi
   fi
 
   log "Associating EIP allocation $ALLOCATION_ID to interface $NETWORK_INTERFACE_ID"
@@ -74,7 +117,7 @@ allocate_aws() {
     --allocation-id "$ALLOCATION_ID" \
     --network-interface-id "$NETWORK_INTERFACE_ID" \
     --region "$REGION" \
-    --no-allow-reassociation
+    $REASSOCIATE
 
   log "EIP associated successfully"
 }
